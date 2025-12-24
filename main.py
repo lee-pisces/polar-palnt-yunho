@@ -31,7 +31,7 @@ PLOTLY_FONT_FAMILY = "Malgun Gothic, Apple SD Gothic Neo, Noto Sans KR, sans-ser
 
 
 # -----------------------------
-# Constants (business logic)
+# Constants
 # -----------------------------
 SCHOOLS: List[str] = ["송도고", "하늘고", "아라고", "동산고"]
 SCHOOL_EC_TARGET: Dict[str, float] = {"송도고": 1.0, "하늘고": 2.0, "아라고": 4.0, "동산고": 8.0}
@@ -39,7 +39,7 @@ SCHOOL_N_EXPECTED: Dict[str, int] = {"동산고": 58, "송도고": 29, "아라�
 
 SCHOOL_COLOR: Dict[str, str] = {
     "송도고": "#1f77b4",
-    "하늘고": "#2ca02c",  # 최적 강조 색상(녹색 계열)
+    "하늘고": "#2ca02c",
     "아라고": "#ff7f0e",
     "동산고": "#d62728",
 }
@@ -59,22 +59,26 @@ def _norm_nfd(s: str) -> str:
     return unicodedata.normalize("NFD", s)
 
 
-def _is_same_filename(a: str, b: str) -> bool:
-    """
-    NFC/NFD 양방향 비교:
-    - a/b 각각에 대해 NFC, NFD로 정규화한 경우를 모두 비교
-    """
+def _is_same_text(a: str, b: str) -> bool:
     a_variants = {_norm_nfc(a), _norm_nfd(a)}
     b_variants = {_norm_nfc(b), _norm_nfd(b)}
     return len(a_variants.intersection(b_variants)) > 0
 
 
+def _norm_for_match(s: str) -> str:
+    """
+    파일명 변형(공백/언더스코어/하이픈/괄호 등)에도 견고하도록
+    비교용 문자열을 단순화.
+    """
+    x = _norm_nfc(s).lower()
+    for ch in [" ", "_", "-", "(", ")", "[", "]", "{", "}", ".", ","]:
+        x = x.replace(ch, "")
+    return x
+
+
 def find_file_by_exact_names(folder: Path, exact_names: List[str]) -> Optional[Path]:
     """
-    pathlib.Path.iterdir()로만 파일을 스캔하고,
-    NFC/NFD 정규화를 양방향으로 비교하여 정확히 매칭되는 파일을 찾는다.
-    - glob 패턴 기반 탐색 금지 준수
-    - f-string 조합으로 파일명 만들지 않음
+    iterdir + NFC/NFD 양방향 비교로 '정확 이름' 매칭
     """
     if not folder.exists() or not folder.is_dir():
         return None
@@ -83,41 +87,87 @@ def find_file_by_exact_names(folder: Path, exact_names: List[str]) -> Optional[P
         if not p.is_file():
             continue
         for name in exact_names:
-            if _is_same_filename(p.name, name):
+            if _is_same_text(p.name, name):
                 return p
     return None
 
 
-def best_match_sheet_name(sheet_names: List[str], school: str) -> Optional[str]:
+def find_best_env_csv(folder: Path, school: str) -> Optional[Path]:
     """
-    시트명 하드코딩 금지 준수:
-    - 실제 엑셀의 sheet_names를 받아서
-    - 학교명이 포함된(정규화 포함) 시트를 '추정'하여 매칭
+    정확 매칭 실패 시 fallback:
+    - iterdir()로 data 폴더 내 .csv 파일을 모두 스캔
+    - 파일명에 학교명/환경 관련 키워드가 포함된 후보를 점수화하여 최적 1개 선택
+    - glob-only 탐색 금지 준수 (glob 사용 안 함)
     """
-    school_variants = {_norm_nfc(school), _norm_nfd(school)}
-    candidates: List[Tuple[int, str]] = []
+    if not folder.exists() or not folder.is_dir():
+        return None
 
-    for s in sheet_names:
-        s_variants = {_norm_nfc(s), _norm_nfd(s)}
-        # 포함 여부(양방향)
-        hit = 0
-        for sv in school_variants:
-            for sh in s_variants:
-                if sv in sh or sh in sv:
-                    hit = 1
-                    break
-            if hit:
+    school_key = _norm_for_match(school)
+    # 환경데이터 파일에서 흔히 등장하는 토큰(변형 포함)
+    env_tokens = ["환경", "환경데이터", "환경data", "env", "environment"]
+    env_tokens_norm = [_norm_for_match(t) for t in env_tokens]
+
+    candidates: List[Tuple[int, Path]] = []
+
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        # 확장자 검사도 정규화로 처리(대문자 CSV 등)
+        if _norm_for_match(p.suffix) != "csv":
+            continue
+
+        name_norm = _norm_for_match(p.name)
+
+        score = 0
+        # 학교명 포함 여부(가장 중요)
+        if school_key and (school_key in name_norm):
+            score += 100
+
+        # 환경 토큰 포함 여부
+        for tok in env_tokens_norm:
+            if tok and (tok in name_norm):
+                score += 30
                 break
-        if hit:
-            # 더 짧고 정확한 이름을 우선
-            score = 1000 - len(_norm_nfc(s))
-            candidates.append((score, s))
+
+        # 너무 일반적인 csv(학교명도 환경도 없는 경우)는 탈락
+        if score == 0:
+            continue
+
+        # 파일명이 짧고 명확할수록 가산(과대선정 방지용)
+        score += max(0, 50 - len(name_norm))
+        candidates.append((score, p))
 
     if not candidates:
         return None
 
-    candidates.sort(reverse=True, key=lambda x: x[0])
+    # 최고 점수 1개 선택
+    candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
+
+
+def best_match_sheet_name(sheet_names: List[str], school: str) -> Optional[str]:
+    """
+    시트명 하드코딩 금지:
+    - 실제 sheet_names에서 학교명 포함 시트를 정규화 포함 매칭
+    """
+    school_norm = _norm_for_match(school)
+
+    scored: List[Tuple[int, str]] = []
+    for s in sheet_names:
+        s_norm = _norm_for_match(s)
+        score = 0
+        if school_norm and (school_norm in s_norm or s_norm in school_norm):
+            score += 100
+        # 짧고 명확한 시트명 선호
+        score += max(0, 80 - len(s_norm))
+        if score > 0:
+            scored.append((score, s))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]
 
 
 # -----------------------------
@@ -126,18 +176,15 @@ def best_match_sheet_name(sheet_names: List[str], school: str) -> Optional[str]:
 @st.cache_data(show_spinner=False)
 def load_env_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # 컬럼 유효성 검사
+
     missing = [c for c in ENV_REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"환경 CSV에 필수 컬럼이 없습니다: {missing}")
 
-    # time 파싱
     df = df.copy()
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df = df.dropna(subset=["time"])
-    df = df.sort_values("time")
+    df = df.dropna(subset=["time"]).sort_values("time")
 
-    # 수치형 변환
     for col in ["temperature", "humidity", "ph", "ec"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["temperature", "humidity", "ph", "ec"])
@@ -146,9 +193,6 @@ def load_env_csv(path: Path) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_growth_xlsx_all_sheets(path: Path) -> Dict[str, pd.DataFrame]:
-    """
-    sheet_name=None으로 전체 시트 로딩 (시트명 하드코딩 금지 준수)
-    """
     data = pd.read_excel(path, sheet_name=None, engine="openpyxl")
     cleaned: Dict[str, pd.DataFrame] = {}
 
@@ -156,13 +200,9 @@ def load_growth_xlsx_all_sheets(path: Path) -> Dict[str, pd.DataFrame]:
         if df is None or df.empty:
             continue
         df = df.copy()
-        # 필수 컬럼이 다 없을 수도 있으니, 포함된 경우만 사용
-        has_all = all(c in df.columns for c in GROW_REQUIRED_COLS)
-        if not has_all:
-            # 시트가 다른 형식일 수 있으므로 스킵
+        if not all(c in df.columns for c in GROW_REQUIRED_COLS):
             continue
 
-        # 수치형 변환
         for col in ["잎 수(장)", "지상부 길이(mm)", "지하부길이(mm)", "생중량(g)"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["생중량(g)"])
@@ -192,6 +232,7 @@ def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "data") -> io.BytesIO:
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 
+# "정확 이름" 후보는 유지하되, 실패하면 자동 탐색으로 대체
 CSV_NAME_CANDIDATES: Dict[str, List[str]] = {
     "송도고": ["송도고_환경데이터.csv"],
     "하늘고": ["하늘고_환경데이터.csv"],
@@ -202,26 +243,37 @@ XLSX_NAME_CANDIDATES = ["4개교_생육결과데이터.xlsx"]
 
 
 def load_all_data() -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], Path, Dict[str, Path]]:
-    """
-    returns:
-      env_by_school, growth_by_school, xlsx_path, csv_paths_by_school
-    """
     if not DATA_DIR.exists():
         raise FileNotFoundError(f"data 폴더를 찾지 못했습니다: {DATA_DIR}")
 
-    csv_paths: Dict[str, Path] = {}
     env_by_school: Dict[str, pd.DataFrame] = {}
+    csv_paths: Dict[str, Path] = {}
 
     for school in SCHOOLS:
+        # 1) 정확 이름 매칭 시도
         p = find_file_by_exact_names(DATA_DIR, CSV_NAME_CANDIDATES[school])
+        # 2) 실패 시 fallback: 폴더 내 csv 스캔 후 최적 후보 선택
         if p is None:
-            raise FileNotFoundError(f"환경 데이터 파일을 찾지 못했습니다: {CSV_NAME_CANDIDATES[school]}")
+            p = find_best_env_csv(DATA_DIR, school)
+
+        if p is None:
+            # 디버깅용: data 폴더의 실제 파일명 목록 제공(Cloud에서도 확인 가능)
+            existing = [q.name for q in DATA_DIR.iterdir() if q.is_file()]
+            raise FileNotFoundError(
+                f"환경 데이터 파일을 찾지 못했습니다: {CSV_NAME_CANDIDATES[school]}\n"
+                f"- data 폴더 파일 목록: {existing}"
+            )
+
         csv_paths[school] = p
         env_by_school[school] = load_env_csv(p)
 
     xlsx_path = find_file_by_exact_names(DATA_DIR, XLSX_NAME_CANDIDATES)
     if xlsx_path is None:
-        raise FileNotFoundError(f"생육 결과 엑셀 파일을 찾지 못했습니다: {XLSX_NAME_CANDIDATES}")
+        existing = [q.name for q in DATA_DIR.iterdir() if q.is_file()]
+        raise FileNotFoundError(
+            f"생육 결과 엑셀 파일을 찾지 못했습니다: {XLSX_NAME_CANDIDATES}\n"
+            f"- data 폴더 파일 목록: {existing}"
+        )
 
     sheets = load_growth_xlsx_all_sheets(xlsx_path)
     sheet_names = list(sheets.keys())
@@ -231,8 +283,8 @@ def load_all_data() -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], P
         matched = best_match_sheet_name(sheet_names, school)
         if matched is None:
             raise FileNotFoundError(
-                f"엑셀 시트 중 '{school}'에 해당하는 시트를 찾지 못했습니다. "
-                f"(현재 유효 시트: {sheet_names})"
+                f"엑셀 시트 중 '{school}'에 해당하는 시트를 찾지 못했습니다.\n"
+                f"- 현재 유효 시트: {sheet_names}"
             )
         growth_by_school[school] = sheets[matched].copy()
 
@@ -240,7 +292,7 @@ def load_all_data() -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], P
 
 
 # -----------------------------
-# Metrics helpers
+# Analysis helpers
 # -----------------------------
 def env_summary_table(env_by_school: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     rows = []
@@ -276,10 +328,6 @@ def growth_summary_table(growth_by_school: Dict[str, pd.DataFrame]) -> pd.DataFr
 
 
 def best_ec_from_growth(growth_by_school: Dict[str, pd.DataFrame]) -> Tuple[float, str, float]:
-    """
-    평균 생중량 최대인 EC를 '최적'으로 산출
-    returns: best_ec, best_school, best_mean_weight
-    """
     best_school = None
     best_mean = None
     best_ec = None
@@ -314,15 +362,13 @@ env_summary = env_summary_table(env_by_school)
 growth_summary = growth_summary_table(growth_by_school)
 best_ec, best_school, best_mean_w = best_ec_from_growth(growth_by_school)
 
-# school filter views
 selected_schools = SCHOOLS if school_option == "전체" else [school_option]
-
 
 tab1, tab2, tab3 = st.tabs(["📖 실험 개요", "🌡️ 환경 데이터", "📊 생육 결과"])
 
 
 # -----------------------------
-# Tab 1: Overview
+# Tab 1
 # -----------------------------
 with tab1:
     st.subheader("연구 배경 및 목적")
@@ -334,20 +380,14 @@ with tab1:
     )
 
     st.subheader("학교별 EC 조건")
-    cond_rows = []
-    for s in SCHOOLS:
-        cond_rows.append(
-            {
-                "학교명": s,
-                "EC 목표": SCHOOL_EC_TARGET[s],
-                "개체수(예상)": SCHOOL_N_EXPECTED.get(s, None),
-                "색상": SCHOOL_COLOR[s],
-            }
-        )
-    cond_df = pd.DataFrame(cond_rows)
+    cond_df = pd.DataFrame(
+        [
+            {"학교명": s, "EC 목표": SCHOOL_EC_TARGET[s], "개체수": SCHOOL_N_EXPECTED.get(s, None), "색상": SCHOOL_COLOR[s]}
+            for s in SCHOOLS
+        ]
+    )
     st.dataframe(cond_df, use_container_width=True)
 
-    # KPI cards
     total_n = int(sum(int(growth_by_school[s].shape[0]) for s in SCHOOLS))
     avg_temp_all = float(pd.concat([env_by_school[s][["temperature"]] for s in SCHOOLS])["temperature"].mean())
     avg_hum_all = float(pd.concat([env_by_school[s][["humidity"]] for s in SCHOOLS])["humidity"].mean())
@@ -360,7 +400,7 @@ with tab1:
 
 
 # -----------------------------
-# Tab 2: Environment data
+# Tab 2
 # -----------------------------
 with tab2:
     st.subheader("학교별 환경 평균 비교")
@@ -372,68 +412,31 @@ with tab2:
     fig = make_subplots(
         rows=2,
         cols=2,
-        subplot_titles=("평균 온도", "평균 습도", "평균 pH", "목표 EC vs 실측 EC(평균)"),
+        subplot_titles=("평균 온도", "평균 습도", "평균 pH", "목표 EC vs 실측 EC 비교(평균)"),
         horizontal_spacing=0.12,
         vertical_spacing=0.15,
     )
 
-    # 평균 온도
     fig.add_trace(
-        go.Bar(
-            x=env_view["학교"],
-            y=env_view["평균 온도(°C)"],
-            name="평균 온도",
-            marker_color=[SCHOOL_COLOR[s] for s in env_view["학교"]],
-        ),
-        row=1,
-        col=1,
+        go.Bar(x=env_view["학교"], y=env_view["평균 온도(°C)"], name="평균 온도",
+               marker_color=[SCHOOL_COLOR[str(s)] for s in env_view["학교"]]),
+        row=1, col=1
     )
 
-    # 평균 습도
     fig.add_trace(
-        go.Bar(
-            x=env_view["학교"],
-            y=env_view["평균 습도(%)"],
-            name="평균 습도",
-            marker_color=[SCHOOL_COLOR[s] for s in env_view["학교"]],
-        ),
-        row=1,
-        col=2,
+        go.Bar(x=env_view["학교"], y=env_view["평균 습도(%)"], name="평균 습도",
+               marker_color=[SCHOOL_COLOR[str(s)] for s in env_view["학교"]]),
+        row=1, col=2
     )
 
-    # 평균 pH
     fig.add_trace(
-        go.Bar(
-            x=env_view["학교"],
-            y=env_view["평균 pH"],
-            name="평균 pH",
-            marker_color=[SCHOOL_COLOR[s] for s in env_view["학교"]],
-        ),
-        row=2,
-        col=1,
+        go.Bar(x=env_view["학교"], y=env_view["평균 pH"], name="평균 pH",
+               marker_color=[SCHOOL_COLOR[str(s)] for s in env_view["학교"]]),
+        row=2, col=1
     )
 
-    # 목표 EC vs 실측 EC(평균)
-    fig.add_trace(
-        go.Bar(
-            x=env_view["학교"],
-            y=env_view["목표 EC"],
-            name="목표 EC",
-            opacity=0.7,
-        ),
-        row=2,
-        col=2,
-    )
-    fig.add_trace(
-        go.Bar(
-            x=env_view["학교"],
-            y=env_view["실측 평균 EC"],
-            name="실측 평균 EC",
-            opacity=0.7,
-        ),
-        row=2,
-        col=2,
-    )
+    fig.add_trace(go.Bar(x=env_view["학교"], y=env_view["목표 EC"], name="목표 EC", opacity=0.7), row=2, col=2)
+    fig.add_trace(go.Bar(x=env_view["학교"], y=env_view["실측 평균 EC"], name="실측 평균 EC", opacity=0.7), row=2, col=2)
 
     fig.update_layout(
         barmode="group",
@@ -447,30 +450,25 @@ with tab2:
     st.divider()
     st.subheader("선택한 학교 시계열")
 
-    # 합계(전체) 혹은 단일학교
     if school_option == "전체":
-        st.info("전체 선택 시, 학교별 시계열은 각각 표시합니다(측정 주기가 다르기 때문입니다).")
+        st.info("전체 선택 시, 학교별 측정 주기가 다르므로 학교별 시계열을 각각 표시합니다.")
         for s in selected_schools:
             df = env_by_school[s]
             st.markdown(f"**{s}**")
             t1, t2, t3 = st.columns(3)
 
-            # 온도
             fig_t = px.line(df, x="time", y="temperature", title="온도 변화")
             fig_t.update_layout(font=dict(family=PLOTLY_FONT_FAMILY), height=320)
             t1.plotly_chart(fig_t, use_container_width=True)
 
-            # 습도
             fig_h = px.line(df, x="time", y="humidity", title="습도 변화")
             fig_h.update_layout(font=dict(family=PLOTLY_FONT_FAMILY), height=320)
             t2.plotly_chart(fig_h, use_container_width=True)
 
-            # EC + 목표선
             fig_ec = px.line(df, x="time", y="ec", title="EC 변화(목표선 포함)")
             fig_ec.add_hline(y=SCHOOL_EC_TARGET[s], line_dash="dash")
             fig_ec.update_layout(font=dict(family=PLOTLY_FONT_FAMILY), height=320)
             t3.plotly_chart(fig_ec, use_container_width=True)
-
     else:
         s = school_option
         df = env_by_school[s]
@@ -490,44 +488,38 @@ with tab2:
         c3.plotly_chart(fig_ec, use_container_width=True)
 
     with st.expander("환경 데이터 원본 테이블 + CSV 다운로드"):
-        # 표시 테이블 (선택 기준)
         if school_option == "전체":
             for s in SCHOOLS:
-                st.markdown(f"**{s}**")
+                st.markdown(f"**{s}**  (파일: {csv_paths[s].name})")
                 st.dataframe(env_by_school[s], use_container_width=True)
-
-                csv_bytes = df_to_csv_bytes(env_by_school[s])
                 st.download_button(
                     label=f"{s} CSV 다운로드",
-                    data=csv_bytes,
+                    data=df_to_csv_bytes(env_by_school[s]),
                     file_name=f"{s}_환경데이터.csv",
                     mime="text/csv",
                 )
         else:
             s = school_option
+            st.markdown(f"**{s}**  (파일: {csv_paths[s].name})")
             st.dataframe(env_by_school[s], use_container_width=True)
-
-            csv_bytes = df_to_csv_bytes(env_by_school[s])
             st.download_button(
                 label=f"{s} CSV 다운로드",
-                data=csv_bytes,
+                data=df_to_csv_bytes(env_by_school[s]),
                 file_name=f"{s}_환경데이터.csv",
                 mime="text/csv",
             )
 
 
 # -----------------------------
-# Tab 3: Growth results
+# Tab 3
 # -----------------------------
 with tab3:
     st.subheader("🥇 핵심 결과: EC별 평균 생중량")
 
-    # EC별 평균 생중량(학교별 = EC조건별)
     growth_sum = growth_summary.copy()
     growth_sum["학교"] = pd.Categorical(growth_sum["학교"], categories=SCHOOLS, ordered=True)
     growth_sum = growth_sum.sort_values("학교")
 
-    # 최고값 강조(하늘고 EC 2.0이 실제 최고가 아닐 수도 있으므로, 데이터 기준으로 최댓값 강조 + 하늘고도 별도 표기)
     max_idx = growth_sum["평균 생중량(g)"].idxmax()
     max_row = growth_sum.loc[max_idx]
     max_ec = float(max_row["EC 목표"])
@@ -538,7 +530,6 @@ with tab3:
     colA.metric("최대 평균 생중량(데이터 기준)", f"{max_mean:.3f} g", f"EC {max_ec:.1f} ({max_school})")
     colA.metric("최적 EC(도출 결과)", f"{best_ec:.1f}", f"학교: {best_school}")
 
-    # 하늘고(EC2.0) 강조 문구
     if SCHOOL_EC_TARGET["하늘고"] == best_ec:
         colA.success("평균 생중량 기준 최적 EC가 하늘고(EC 2.0) 조건으로 도출되었습니다.")
     else:
@@ -573,49 +564,10 @@ with tab3:
         vertical_spacing=0.15,
     )
 
-    # 평균 생중량
-    fig2.add_trace(
-        go.Bar(
-            x=growth_sum["EC 목표"].astype(str),
-            y=growth_sum["평균 생중량(g)"],
-            name="평균 생중량",
-        ),
-        row=1,
-        col=1,
-    )
-
-    # 평균 잎 수
-    fig2.add_trace(
-        go.Bar(
-            x=growth_sum["EC 목표"].astype(str),
-            y=growth_sum["평균 잎 수(장)"],
-            name="평균 잎 수",
-        ),
-        row=1,
-        col=2,
-    )
-
-    # 평균 지상부 길이
-    fig2.add_trace(
-        go.Bar(
-            x=growth_sum["EC 목표"].astype(str),
-            y=growth_sum["평균 지상부 길이(mm)"],
-            name="평균 지상부 길이",
-        ),
-        row=2,
-        col=1,
-    )
-
-    # 개체수
-    fig2.add_trace(
-        go.Bar(
-            x=growth_sum["EC 목표"].astype(str),
-            y=growth_sum["개체수(n)"],
-            name="개체수",
-        ),
-        row=2,
-        col=2,
-    )
+    fig2.add_trace(go.Bar(x=growth_sum["EC 목표"].astype(str), y=growth_sum["평균 생중량(g)"], name="평균 생중량"), row=1, col=1)
+    fig2.add_trace(go.Bar(x=growth_sum["EC 목표"].astype(str), y=growth_sum["평균 잎 수(장)"], name="평균 잎 수"), row=1, col=2)
+    fig2.add_trace(go.Bar(x=growth_sum["EC 목표"].astype(str), y=growth_sum["평균 지상부 길이(mm)"], name="평균 지상부 길이"), row=2, col=1)
+    fig2.add_trace(go.Bar(x=growth_sum["EC 목표"].astype(str), y=growth_sum["개체수(n)"], name="개체수"), row=2, col=2)
 
     fig2.update_layout(
         height=720,
@@ -628,7 +580,6 @@ with tab3:
     st.divider()
     st.subheader("학교별 생중량 분포")
 
-    # 분포 그래프용 long df
     dist_rows = []
     for s in selected_schools:
         df = growth_by_school[s].copy()
@@ -637,7 +588,6 @@ with tab3:
         dist_rows.append(df)
     dist_df = pd.concat(dist_rows, ignore_index=True)
 
-    # violin (또는 box)
     fig_dist = px.violin(
         dist_df,
         x="학교",
@@ -654,25 +604,11 @@ with tab3:
 
     c1, c2 = st.columns(2)
 
-    fig_sc1 = px.scatter(
-        dist_df,
-        x="잎 수(장)",
-        y="생중량(g)",
-        color="학교",
-        title="잎 수 vs 생중량",
-        trendline=None,
-    )
+    fig_sc1 = px.scatter(dist_df, x="잎 수(장)", y="생중량(g)", color="학교", title="잎 수 vs 생중량")
     fig_sc1.update_layout(font=dict(family=PLOTLY_FONT_FAMILY), height=480)
     c1.plotly_chart(fig_sc1, use_container_width=True)
 
-    fig_sc2 = px.scatter(
-        dist_df,
-        x="지상부 길이(mm)",
-        y="생중량(g)",
-        color="학교",
-        title="지상부 길이 vs 생중량",
-        trendline=None,
-    )
+    fig_sc2 = px.scatter(dist_df, x="지상부 길이(mm)", y="생중량(g)", color="학교", title="지상부 길이 vs 생중량")
     fig_sc2.update_layout(font=dict(family=PLOTLY_FONT_FAMILY), height=480)
     c2.plotly_chart(fig_sc2, use_container_width=True)
 
@@ -690,7 +626,6 @@ with tab3:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-            # 원본 전체 엑셀 다운로드(업로드 파일 그대로)
             try:
                 raw_bytes = xlsx_path.read_bytes()
                 st.download_button(
